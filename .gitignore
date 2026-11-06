@@ -1,0 +1,7 @@
+# input images are third-party: not committed (see README)
+data/
+# intermediate results and caches
+out/
+__pycache__/
+*.pyc
+.DS_Store
