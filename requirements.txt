@@ -4,5 +4,11 @@ matplotlib>=3.7
 pillow>=9.5
 pot>=0.9
 opencv-python>=4.8
-# only for meowl_gpu.py:
-# pyopencl>=2023.1
+# PyTorch runs the barycenters: on an NVIDIA GPU (CUDA) if it sees one, else on the CPU.
+# For the GPU, install the CUDA build of torch BEFORE this file (see README.md, Setup):
+#   Linux:   pip install torch            (the PyPI wheel includes CUDA; torch 2.15 = CUDA 13,
+#                                           NVIDIA driver >= 580)
+#   Windows: pip install torch --index-url https://download.pytorch.org/whl/cu130
+#            (exact command for your system: https://pytorch.org/get-started/locally/)
+#   driver < 580: pip install "torch<2.15" --index-url https://download.pytorch.org/whl/cu128
+torch>=2.0

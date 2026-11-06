@@ -1,38 +1,35 @@
 """
-meowl_gpu.py -- the sharp cat + owl = meowl, computed on the GPU (OpenCL).
+meowl_gpu.py -- the sharp cat + owl = meowl (or any --pair of cut-outs), computed on a
+CUDA GPU with PyTorch (it used OpenCL before; the CPU is the fallback).
 
 Same maths as photo_barycenter.py (debiased Sinkhorn barycenter, eps-scaling, exact
-log-domain kernel), but the iterations run on the GPU through OpenCL, which is
-the most reliable way to drive an Intel Iris Xe from Python.
+log-domain kernel), and the same code: the iterations are photo_barycenter.barycenter.
+What this script adds: ready-made cut-outs, more photos and alignments (PHOTOS, --pair),
+--bg, and the settings below.
 
-What changed compared with photo_barycenter.py
------------------------------------------
-* GPU kernel.  K = K1 (x) K1 is applied as two fused log-sum-exp passes
+Settings that differ from photo_barycenter.py (kept from the OpenCL version)
+---------------------------------------------------------------------------
+* Kernel.  K = K1 (x) K1 is applied as two log-sum-exp passes
       out[i, j] = log sum_k exp(-(t_i - t_k)^2 / eps + V[k, j])
-  computed on the fly (no N x N kernel matrix, no N^3 temporaries), tiled in
-  local memory with a blocked online max.  It is exact for every eps, so the
-  fast-but-fragile matrix-product kernel is gone.
-* float32.  Iris Xe has no double precision in hardware.  The log-domain
-  iterations are stable in float32; the marginal error bottoms out around
-  1e-4..1e-3 at small eps (invisible in the picture), so the stall test
-  stops as soon as no more progress is being made.
+  computed exactly for every eps (the matrix-product kernel is never used).
+* float32 on the GPU.  The log-domain iterations are stable in float32; the
+  marginal error bottoms out around 1e-4..1e-3 at small eps (invisible in the
+  picture), so the stall test stops as soon as no more progress is being made
+  (300 iterations without progress on the last eps, 100 on the others).
 * The photos are segmented once per run, not once per frame.
 
 Install
 -------
-    pip install numpy scipy pillow opencv-python pyopencl
-
-  Windows: the OpenCL driver for Iris Xe ships with the Intel graphics driver.
-  Linux (Ubuntu/Debian): sudo apt install intel-opencl-icd   (then `clinfo` should list it)
+    pip install -r requirements.txt     (PyTorch with CUDA: see README.md)
 
 Usage
 -----
-    python meowl_gpu.py --list-devices          # check that the Iris Xe is visible
+    python meowl_gpu.py --list-devices          # check that PyTorch sees the GPU
     python meowl_gpu.py                         # 256 px, eps 1e-4, debiased, 5 frames
     python meowl_gpu.py --size 384 --eps 4e-5   # sharper
     python meowl_gpu.py --size 512 --eps 2e-5 --steps 8 --verbose
     python meowl_gpu.py --no-debias             # classical Sinkhorn barycenter
-    python meowl_gpu.py --device cpu            # any OpenCL device whose name matches
+    python meowl_gpu.py --device cpu            # force the CPU (default: CUDA GPU if any)
     python meowl_gpu.py --pair brown_owl snowy_owl   # other photos (see PHOTOS)
 
 Rule of thumb: keep eps >= 2/size^2 (kernel at least ~1 pixel wide).
@@ -47,10 +44,13 @@ import argparse
 import os
 import time
 
+_USER_THREADS = os.environ.get("OMP_NUM_THREADS")   # photo_barycenter sets 1 if unset
 import numpy as np
 from scipy import ndimage as ndi
-from scipy.special import logsumexp
 from PIL import Image
+
+import otlib
+import photo_barycenter as pb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -84,7 +84,6 @@ PHOTOS = {
 FACE_EYE_DIST, FACE_EYE_Y = 0.18, 0.33   # eye distance and eye height on the canvas (fractions)
 FIT = 0.9                                # "fit": bounding box fills this much of the canvas
 WORK = 1024             # resolution of the aligned canvas before downsampling
-NEG = -1e30             # "log 0": finite, so no inf/nan can appear on the GPU
 
 
 # =============================================================================
@@ -179,229 +178,38 @@ def aligned(name, N):
 
 
 # =============================================================================
-# OpenCL: fused log-sum-exp kernels
+# Device (PyTorch: CUDA, or the CPU as fallback)
 # =============================================================================
-KERNEL_SRC = r"""
-#ifdef EXACT_EXP
-#define EXPF(x) exp(x)
-#else
-#define EXPF(x) native_exp(x)
-#endif
-#define NEG (-1e30f)
-
-/* Adds the T terms  -c (pos - k0 - q)^2 + t[q * stride]  to a running log-sum-exp
-   (m, s): max of the tile first, rescale the running sum once, then one exp per term. */
-inline void lse_tile(__local const float *t, const int stride, const int pos, const int k0,
-                     const float c, float *m, float *s)
-{
-    float x[T], cm = NEG;
-    #pragma unroll
-    for (int q = 0; q < T; q++) {
-        const float d = (float)(pos - k0 - q);
-        x[q] = t[q * stride] - c * d * d;
-        cm = fmax(cm, x[q]);
-    }
-    const float nm = fmax(*m, cm);
-    float acc = *s * EXPF(*m - nm);
-    #pragma unroll
-    for (int q = 0; q < T; q++) acc += EXPF(x[q] - nm);
-    *s = acc; *m = nm;
-}
-
-/* out[i, j] = log sum_k exp(-c (i - k)^2 + V[k, j])     (sum over the row index)
-   One work-item per output; k runs over tiles of T rows staged in local memory. */
-__kernel __attribute__((reqd_work_group_size(T, T, 1)))
-void lse_rows(__global const float *V, __global float *out, const int N, const float c)
-{
-    const int lj = get_local_id(0), li = get_local_id(1);
-    const int j = get_group_id(0) * T + lj, i = get_group_id(1) * T + li;
-    __local float tile[T][T];
-    float m = NEG, s = 0.0f;
-    for (int k0 = 0; k0 < N; k0 += T) {
-        const int k = k0 + li;
-        tile[li][lj] = (k < N && j < N) ? V[k * N + j] : NEG;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        lse_tile(&tile[0][lj], T, i, k0, c, &m, &s);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (i < N && j < N) out[i * N + j] = m + log(s);
-}
-
-/* out[i, j] = log sum_k exp(-c (j - k)^2 + V[i, k])     (sum over the column index) */
-__kernel __attribute__((reqd_work_group_size(T, T, 1)))
-void lse_cols(__global const float *V, __global float *out, const int N, const float c)
-{
-    const int lj = get_local_id(0), li = get_local_id(1);
-    const int j = get_group_id(0) * T + lj, i = get_group_id(1) * T + li;
-    __local float tile[T][T + 1];
-    float m = NEG, s = 0.0f;
-    for (int k0 = 0; k0 < N; k0 += T) {
-        const int k = k0 + lj;
-        tile[li][lj] = (k < N && i < N) ? V[i * N + k] : NEG;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        lse_tile(&tile[li][0], 1, j, k0, c, &m, &s);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (i < N && j < N) out[i * N + j] = m + log(s);
-}
-"""
-
-
 def list_devices():
-    import pyopencl as cl
-    try:
-        platforms = cl.get_platforms()
-    except cl.Error:
-        platforms = []
+    import torch
     out = []
-    for p in platforms:
-        for d in p.get_devices():
-            out.append((p, d))
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            pr = torch.cuda.get_device_properties(i)
+            out.append(f"cuda:{i}  {pr.name}  ({pr.multi_processor_count} SMs, "
+                       f"{pr.total_memory // 2**20} MiB, compute capability {pr.major}.{pr.minor})")
     return out
 
 
-class GPU:
-    """OpenCL context + the operations the Sinkhorn loop needs (float32, device-resident)."""
-
-    def __init__(self, hint=None, exact_exp=False):
-        import pyopencl as cl
-        import pyopencl.array as cla
-        from pyopencl.tools import MemoryPool, ImmediateAllocator
-        self.cl, self.cla = cl, cla
-        devs = list_devices()
-        if not devs:
-            raise SystemExit(
-                "No OpenCL device found.\n"
-                "  Windows: update the Intel graphics driver (it contains the OpenCL runtime).\n"
-                "  Linux:   sudo apt install intel-opencl-icd   (check with: clinfo)")
-        if hint:
-            h = hint.lower()
-            pick = [(p, d) for p, d in devs if
-                    (h == "gpu" and d.type & cl.device_type.GPU) or
-                    (h == "cpu" and d.type & cl.device_type.CPU) or
-                    h in d.name.lower() or h in p.name.lower()]
-            if not pick:
-                raise SystemExit(f"no OpenCL device matches '{hint}'; try --list-devices")
-        else:
-            pick = [(p, d) for p, d in devs if d.type & cl.device_type.GPU] or devs
-            if not pick[0][1].type & cl.device_type.GPU:
-                print("warning: no OpenCL GPU found, running on", pick[0][1].name.strip())
-        self.device = pick[0][1]
-        self.ctx = cl.Context([self.device])
-        self.queue = cl.CommandQueue(self.ctx)
-        self.alloc = MemoryPool(ImmediateAllocator(self.queue))
-        self.T = 16 if self.device.max_work_group_size >= 256 else 8
-        opts = [f"-DT={self.T}"] + (["-DEXACT_EXP"] if exact_exp else [])
-        self.prg = cl.Program(self.ctx, KERNEL_SRC).build(options=opts)
-        self._rows, self._cols = self.prg.lse_rows, self.prg.lse_cols
-
-    @property
-    def name(self):
-        return self.device.name.strip()
-
-    def put(self, x):
-        return self.cla.to_device(self.queue, np.ascontiguousarray(x, np.float32), allocator=self.alloc)
-
-    def K(self, V, eps):
-        """log(K exp(V)) for the Gibbs kernel exp(-|x-y|^2/eps) on linspace(0,1,N)^2."""
-        N = V.shape[0]
-        c = np.float32(1.0 / ((N - 1) ** 2 * eps))       # (t_i - t_k)^2/eps = c (i - k)^2
-        g = ((N + self.T - 1) // self.T) * self.T
-        tmp = self.cla.empty_like(V)
-        out = self.cla.empty_like(V)
-        self._rows(self.queue, (g, g), (self.T, self.T), V.data, tmp.data, np.int32(N), c)
-        self._cols(self.queue, (g, g), (self.T, self.T), tmp.data, out.data, np.int32(N), c)
-        return out
-
-    # The two reductions are done on the host (N^2 numbers, cheap on an integrated GPU,
-    # and in float64): |u * (K v) - a|_1 every 20 iterations, and the global log-sum-exp
-    # that normalises b (classical barycenter only).
-    @staticmethod
-    def marginal_error(u, Kv, a):
-        return float(np.abs(np.exp(u.get().astype(np.float64) + Kv.get()) - a).sum())
-
-    @staticmethod
-    def logsumexp(x):
-        return float(logsumexp(x.get().astype(np.float64)))
-
-
 # =============================================================================
-# (Debiased) Sinkhorn barycenter: eps-scaling, coarse-to-fine, warm start
+# (Debiased) Sinkhorn barycenter: eps-scaling, warm start (photo_barycenter.barycenter)
 # =============================================================================
-def barycenter(gpu, fields, lam, eps, debias=True, eps_start=1e-2, shrink=0.6,
-               tol=1e-4, max_iter=20000, stage_iter=300, patience=300, verbose=False):
-    """(Debiased) Sinkhorn barycenter of 2D histograms, iterated on the GPU.
-
-    Iterations (log domain, as in notebooks/barycenters.ipynb):
-        u_k = a_k / (K v_k)
-        b   = c * prod_k (K^T u_k)^lam_k        (c = 1 for the classical barycenter)
-        v_k = b / (K^T u_k)
-        c   = sqrt(c * b / (K c))               (debiasing, Janati et al. 2020)
-    Stops when the marginal error sum_k |u_k * (K v_k) - a_k|_1 < tol, or when it has
-    not improved for `patience` iterations (float32 floor).
-    Returns b (host, float64), log u_k and log(K^T u_k) (on the GPU, for the colours)
-    and the number of iterations.
+def barycenter(fields, lam, eps, debias=True, eps_start=1e-2, shrink=0.6,
+               tol=1e-4, max_iter=20000, stage_iter=300, patience=300, verbose=False,
+               device="auto", dtype="auto"):
+    """(Debiased) Sinkhorn barycenter of 2D histograms (photo_barycenter.barycenter with
+    this script's settings: exact kernel at every eps, stall test after `patience`
+    iterations on the last eps and 100 on the others).
+    Returns b (host, float64), log u_k and log(K^T u_k) (on the device, for the colours),
+    the kernel and the number of iterations.
     """
-    lam = np.asarray(lam, float) / np.sum(lam)
-    N = fields[0].shape[0]
-    schedule, e = [], max(eps_start, eps)
-    while e > eps:
-        schedule.append(e); e *= shrink
-    schedule.append(eps)
-    # log of the inputs, NEG (= log 0) where there is no mass (a tiny constant instead
-    # makes u = a / Kv explode outside the shapes and breaks the stabilisation)
-    logA = [gpu.put(np.where(a > 0, np.log(np.where(a > 0, a, 1.0)), NEG)) for a in fields]
-    lnv = [gpu.put(np.zeros((N, N))) for _ in fields]
-    lnc = gpu.put(np.zeros((N, N)))
-    lam32 = [np.float32(l) for l in lam]
-    total = 0
-    for s, e in enumerate(schedule):
-        if s > 0:                                    # keep the dual potentials eps*log(.)
-            r = np.float32(schedule[s - 1] / e)
-            lnv = [v * r for v in lnv]; lnc = lnc * r
-        last = s == len(schedule) - 1
-        err, best, best_it = np.inf, np.inf, 0
-        for it in range(max_iter if last else stage_iter):
-            lnu = [la - gpu.K(v, e) for la, v in zip(logA, lnv)]
-            lnKtu = [gpu.K(u, e) for u in lnu]
-            lnb = lnKtu[0] * lam32[0]
-            for l, x in zip(lam32[1:], lnKtu[1:]):
-                lnb = lnb + x * l
-            if debias:
-                lnb = lnb + lnc
-                for _ in range(3):
-                    lnc = (lnc + lnb - gpu.K(lnc, e)) * np.float32(0.5)
-            else:
-                lnb = lnb - np.float32(gpu.logsumexp(lnb))
-            lnv = [lnb - x for x in lnKtu]
-            total += 1
-            if it % 20 == 19:
-                err = sum(gpu.marginal_error(u, gpu.K(v, e), a) for u, v, a in zip(lnu, lnv, fields))
-                if verbose and last and it % 500 == 499:
-                    print(f"    eps={e:.2e}  iteration {total}  marginal error {err:.1e}", flush=True)
-                if err < (tol if last else 1e-3):
-                    break
-                if err < 0.98 * best:
-                    best, best_it = err, it
-                elif it - best_it > (patience if last else 100):   # float32 floor reached
-                    break
-        if verbose:
-            print(f"    eps={e:.2e}  iterations so far {total}  marginal error {err:.1e}", flush=True)
-    lnb_h = lnb.get().astype(np.float64)
-    b = np.exp(lnb_h - logsumexp(lnb_h))
-    return b, lnu, lnKtu, total
+    return pb.barycenter(fields, lam, eps, debias=debias, eps_start=eps_start, shrink=shrink,
+                         tol=tol, max_iter=max_iter, stage_iter=stage_iter,
+                         exact_below=np.inf, patience=patience, stage_patience=100,
+                         verbose=verbose, device=device, dtype=dtype, return_iterations=True)
 
 
-def transported_colour(gpu, colours, lam, lnu, lnKtu, eps):
-    """Mean colour arriving at each barycenter pixel: [K^T(u_k c_k)] / [K^T u_k], mixed by lam."""
-    out = 0
-    for l, c, u, ktu in zip(lam, colours, lnu, lnKtu):
-        chans = []
-        for ch in range(3):
-            lc = gpu.put(np.log(c[..., ch] + 1e-4))
-            chans.append(np.exp((gpu.K(u + lc, eps) - ktu).get().astype(np.float64)))
-        out = out + l * np.stack(chans, -1)
-    return np.clip(out, 0, 1)
+transported_colour = pb.transported_colour     # [K^T(u_k c_k)] / [K^T u_k], mixed by lam
 
 
 # =============================================================================
@@ -429,11 +237,8 @@ def main():
                    choices=sorted(PHOTOS), help="the two photos to interpolate (default: cat owl)")
     p.add_argument("--out", default=None,
                    help="output folder (default: meowl_out for cat owl, FROM_TO_out otherwise)")
-    p.add_argument("--device", default=None,
-                   help="OpenCL device to use: 'gpu', 'cpu' or part of its name (default: first GPU)")
-    p.add_argument("--list-devices", action="store_true", help="list OpenCL devices and exit")
-    p.add_argument("--exact-exp", action="store_true",
-                   help="use the full-precision exp in the kernel (slower; only if results look off)")
+    otlib.add_device_args(p)
+    p.add_argument("--list-devices", action="store_true", help="list CUDA devices and exit")
     p.add_argument("--bg", choices=["black", "white"], default=None,
                    help="background of the pictures (default: white for silhouettes, else black)")
     p.add_argument("--verbose", action="store_true")
@@ -446,12 +251,13 @@ def main():
     bg = 1.0 if args.bg == "white" else 0.0
 
     if args.list_devices:
+        import torch
         devs = list_devices()
+        print(f"PyTorch {torch.__version__}, built with CUDA {torch.version.cuda}")
         if not devs:
-            print("no OpenCL devices found")
-        for i, (pl, d) in enumerate(devs):
-            print(f"[{i}] {d.name.strip()}  ({pl.name.strip()}, "
-                  f"{d.max_compute_units} compute units, {d.global_mem_size // 2**20} MiB)")
+            otlib.pick_device("cuda")                # prints why there is no GPU
+        for d in devs:
+            print(d)
         return
     if args.eps < 2.0 / args.size ** 2:
         print(f"warning: eps={args.eps:g} is below one pixel for size {args.size}; "
@@ -470,14 +276,17 @@ def main():
             todo.append(k)
 
     if todo:
-        gpu = GPU(args.device, args.exact_exp)
-        print(f"OpenCL device: {gpu.name}", flush=True)
+        dev = otlib.pick_device(args.device)
+        if dev.type == "cpu" and _USER_THREADS is None:   # CPU fallback: use every core
+            import torch
+            torch.set_num_threads(os.cpu_count())
+        print(f"device: {otlib.describe(dev, otlib.pick_dtype(dev, args.dtype))}", flush=True)
         for k in todo:                               # one GPU: frames one after another
             t1 = time.time()
             t = k / args.steps
-            b, lnu, lnKtu, its = barycenter(gpu, [mc, mo], [1 - t, t], args.eps,
-                                            debias=args.debias, verbose=args.verbose)
-            colour = transported_colour(gpu, [cc, co], [1 - t, t], lnu, lnKtu, args.eps)
+            b, lnu, lnKtu, K, its = barycenter([mc, mo], [1 - t, t], args.eps, debias=args.debias,
+                                               verbose=args.verbose, device=dev, dtype=args.dtype)
+            colour = transported_colour([cc, co], [1 - t, t], lnu, lnKtu, K)
             frames[k] = dict(mass=b, colour=colour)
             np.savez(frame_path(args, k), mass=b, colour=colour)
             print(f"  t = {k}/{args.steps} done in {time.time() - t1:.1f}s ({its} iterations)",

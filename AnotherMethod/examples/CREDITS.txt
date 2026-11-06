@@ -1,0 +1,25 @@
+Image credits for the examples
+==============================
+
+Textures (photos from Unsplash, released under CC0 at the time; archived at
+https://github.com/cslr/cc0pictures).  Cropped / downsized for these examples.
+
+  blue_smoke.jpg   crop of Unsplash photo-1477336229416-9d67406e73bc (blue smoke bomb)
+  cheetah_fur.jpg  crop of Unsplash photo-1477120696339-2258698d9d72 (cheetah)
+  ocean_foam.jpg   Unsplash photo-1452110040644-6751c0c95836 (aerial view of sea foam)
+  nebula.jpg       Unsplash photo-1462331940025-496dfbfc7564: the Bubble Nebula (NGC 7635),
+                   (nebula_labels.png: its glowing gas vs dark space, thresholded)
+                   a NASA/ESA Hubble image -- credit: NASA, ESA, Hubble Heritage Team
+
+Shapes (from game-icons.net, https://github.com/game-icons/icons, CC BY 3.0;
+rendered to 1024 px and filled to solid silhouettes):
+
+  shape_dolphin.png  "Dolphin" by Delapouite
+  shape_octopus.png  "Octopus" by Lorc
+  shape_cat.png      "Cat" by Lorc
+
+Suggested caption line for a poster:
+  Textures: Unsplash (CC0) and NASA/ESA; shapes: game-icons.net (Delapouite, Lorc, CC BY 3.0).
+
+  shape_walking_cat.png / tabby_cutout.png  extracted from the walking tabby cat photo you supplied
+                                            (check its licence before using it on the poster)

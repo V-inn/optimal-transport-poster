@@ -4,6 +4,11 @@ owl) for weights on a grid of the triangle: figures/fig_triangle.png (poster, bl
 
     python barycenter_triangle.py              # 192 px, eps 1.5e-4, debiased, weights in thirds
     python barycenter_triangle.py --n-sub 4    # weights in quarters (15 pictures)
+    python barycenter_triangle.py --size 384 --eps 3.5e-5   # sharper (GPU recommended)
+    python barycenter_triangle.py --device cpu # force the CPU (default: CUDA GPU if any)
+
+On a CUDA GPU the barycenters are computed one after another (each one batches its
+photos through the kernel); on the CPU they run in parallel processes (--workers).
 
 Inputs
   cat        data/cat_photo.png (segmented and placed exactly as in photo_barycenter.py)
@@ -25,6 +30,8 @@ import numpy as np
 import cv2
 from PIL import Image
 from scipy import ndimage as ndi
+
+import otlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -52,24 +59,33 @@ def weights(n_sub):
             for i in range(n_sub + 1) for j in range(n_sub + 1 - i)]
 
 
-def job(args_lam):
-    args, lam = args_lam
-    key = "_".join(f"{x:.3f}" for x in lam)
-    path = os.path.join(CACHE, f"{key}_{args.size}_{args.eps:g}.npz")
-    if os.path.exists(path):
-        return key, dict(np.load(path))
+def key_of(lam):
+    return "_".join(f"{x:.3f}" for x in lam)
+
+
+def cache_path(args, lam):
+    return os.path.join(CACHE, f"{key_of(lam)}_{args.size}_{args.eps:g}.npz")
+
+
+def job(job_args):
+    args, lam, ins = job_args
+    key = key_of(lam)
     t0 = time.time()
-    ins = inputs(args.size)
     use = [k for k in range(3) if lam[k] > 0]            # zero weight: leave that photo out
     if len(use) == 1:
         m, c = ins[use[0]]
         out = dict(mass=m, colour=c)
     else:
         fields = [ins[k][0] for k in use]
-        b, lnu, lnKtu, K = ml.barycenter(fields, lam[use], args.eps, debias=True)
+        if not args.quiet:
+            print(f"  lambda = {key}: computing ({len(use)} photos, {args.size} px, eps {args.eps:g})",
+                  flush=True)
+        b, lnu, lnKtu, K = ml.barycenter(fields, lam[use], args.eps, debias=True,
+                                         device=args.device, dtype=args.dtype,
+                                         verbose=not args.quiet)
         out = dict(mass=b, colour=ml.transported_colour([ins[k][1] for k in use], lam[use] / lam[use].sum(),
                                                         lnu, lnKtu, K))
-    np.savez(path, **out)
+    np.savez(cache_path(args, lam), **out)
     print(f"  lambda = {key} done in {time.time() - t0:.0f}s", flush=True)
     return key, out
 
@@ -125,14 +141,35 @@ def main():
     p.add_argument("--eps", type=float, default=1.5e-4,
                    help="keep eps * size^2 >= ~5: below that the fast CPU kernel leaves a dot pattern")
     p.add_argument("--n-sub", type=int, default=3, help="weights in steps of 1/n-sub")
-    p.add_argument("--workers", type=int, default=os.cpu_count())
+    p.add_argument("--workers", type=int, default=os.cpu_count(),
+                   help="parallel processes (CPU only; on the GPU one barycenter after another)")
+    p.add_argument("--quiet", action="store_true", help="no progress lines while computing")
+    otlib.add_device_args(p)
     args = p.parse_args()
     os.makedirs(CACHE, exist_ok=True)
     lams = sorted(weights(args.n_sub), key=lambda l: -np.count_nonzero(l))   # 3-way first
-    from multiprocessing import Pool
     t0 = time.time()
-    with Pool(max(1, min(args.workers, len(lams)))) as pool:
-        frames = dict(pool.imap_unordered(job, [(args, l) for l in lams]))
+    frames = {key_of(l): dict(np.load(cache_path(args, l))) for l in lams
+              if os.path.exists(cache_path(args, l))}
+    todo = [l for l in lams if key_of(l) not in frames]
+    if todo:
+        dev = otlib.pick_device(args.device)
+        args.device = dev.type
+        if dev.type == "cuda" and args.dtype == "auto":
+            print(f"device: {otlib.describe(dev, otlib.pick_dtype(dev, args.dtype))} for eps < 1e-4, "
+                  f"float64 matrix products for eps >= 1e-4", flush=True)
+        else:
+            print(f"device: {otlib.describe(dev, otlib.pick_dtype(dev, args.dtype))}", flush=True)
+        print(f"{len(todo)} barycenters to compute ({len(lams) - len(todo)} already in {CACHE})",
+              flush=True)
+        ins = inputs(args.size)                          # segmented once, shared by all jobs
+        jobs = [(args, l, ins) for l in todo]
+        if dev.type == "cuda" or min(args.workers, len(jobs)) <= 1:
+            frames.update(job(j) for j in jobs)          # one GPU: one barycenter after another
+        else:
+            from multiprocessing import Pool
+            with Pool(min(args.workers, len(jobs))) as pool:
+                frames.update(pool.imap_unordered(job, jobs))
     print(f"barycenters done in {time.time() - t0:.0f}s")
     figure(frames, args.n_sub, args.size)
 
